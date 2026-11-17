@@ -1,0 +1,13 @@
+# Image: langgraph.vertexai.v0.2 — Vertex AI (GCP) only
+# To build for Bedrock: add langchain-aws==1.4.1, boto3, botocore
+# LLMFactory in swagbot_langgraph_workflow_full.py also needs the _bedrock() method restored
+
+flask==3.0.3
+flask-cors==4.0.1
+langchain-core==1.2.22
+langchain-google-vertexai==3.2.2
+langgraph==1.1.6
+ddtrace==4.7.1
+requests==2.32.3
+python-dotenv==1.0.1
+google-cloud-aiplatform>=1.77.0,<2.0.0

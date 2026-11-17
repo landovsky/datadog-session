@@ -1,0 +1,38 @@
+{
+  "planning": {
+    "id": "swagbot.planning",
+    "version": "1.0.0",
+    "description": "Planning agent that analyzes user requests and routes to appropriate specialist agents"
+  },
+  "orchestrator": {
+    "id": "swagbot.orchestrator",
+    "version": "1.0.0",
+    "description": "Orchestrator that creates focused request subsets for each specialized agent"
+  },
+  "customer-service": {
+    "id": "swagbot.customer_service",
+    "version": "1.0.0",
+    "description": "Customer service agent handling support, returns, complaints, and account issues"
+  },
+  "product-specialist": {
+    "id": "swagbot.product_specialist",
+    "version": "1.0.0",
+    "description": "Product specialist agent providing product information, specifications, and recommendations"
+  },
+  "promotion-specialist": {
+    "id": "swagbot.promotion_specialist",
+    "version": "1.0.0",
+    "description": "Promotion specialist agent handling discounts, deals, and special offers"
+  },
+  "feedback-handler": {
+    "id": "swagbot.feedback_handler",
+    "version": "1.0.0",
+    "description": "Feedback handler agent processing customer reviews, ratings, and suggestions"
+  },
+  "synthesizer": {
+    "id": "swagbot.synthesizer",
+    "version": "1.0.0",
+    "description": "Response synthesizer that combines specialist outputs into final user response"
+  }
+}
+

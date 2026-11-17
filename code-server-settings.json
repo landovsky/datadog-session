@@ -1,0 +1,36 @@
+{
+    "workbench.colorTheme": "Default Dark Modern",
+    "workbench.startupEditor": "none",
+    "workbench.secondarySideBar.defaultVisibility": "hidden",
+    "files.autoSave": "afterDelay",
+    "files.autoSaveDelay": 750,
+    "files.exclude": {
+        ".*": true
+    },
+    "editor.minimap.enabled": false,
+    "editor.wordWrap": "on",
+    "redhat.telemetry.enabled": false,
+    "update.mode": "none",
+    "update.showReleaseNotes": false,
+    "vsicons.dontShowNewVersionMessage": true,
+    "extensions.ignoreRecommendations": true,
+    "extensions.autoCheckUpdates": false,
+    "security.workspace.trust.enabled": false,
+    "git.openRepositoryInParentFolders": "never",
+    "chat.disableAIFeatures": false,
+
+    "geminicodeassist.project": "p-digltksce01y-0",
+    "geminicodeassist.enableTelemetry": false,
+    "geminicodeassist.agentYoloMode": false,
+
+    "terminal.integrated.env.osx": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/your/credentials.json",
+        "GOOGLE_PROJECT_ID": "p-digltksce01y-0",
+        "GOOGLE_LOCATION": "global"
+    },
+    "terminal.integrated.env.linux": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/your/credentials.json",
+        "GOOGLE_PROJECT_ID": "p-digltksce01y-0",
+        "GOOGLE_LOCATION": "global"
+    }
+}
