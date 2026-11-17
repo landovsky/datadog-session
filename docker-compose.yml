@@ -43,9 +43,9 @@ services:
       - no-new-privileges:true
     ports:
       - 3000:3000
-    entrypoint: ["ddtrace-run", "python", "swagbot_app.py"]
+    entrypoint: ["/bin/bash", "-c", "ddtrace-run python swagbot_app.py & sleep 2; ddtrace-run python /app/scripts/replay.py & wait"]
   agent:
-    image: gcr.io/datadoghq/agent:7.77.1
+    image: gcr.io/datadoghq/agent:7
     environment:
       - DD_API_KEY
       - DD_ENV=dev

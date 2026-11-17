@@ -1,32 +1,28 @@
 """
-SwagBot LangGraph Workflow — Base version (zero Datadog decorators)
+SwagBot LangGraph Workflow — Full version (Datadog LLM Observability instrumented)
 
-Architecture: an outer StateGraph coordinates seven independent agent subgraphs.
-Each agent is a compiled LangGraphPregel added directly as a node — ddtrace detects
-these as `agent` spans automatically without any manual annotation.
+Same architecture as the base version. Adds manual decorators and annotations on
+top of ddtrace's auto-detection so every span is fully enriched in the Datadog UI.
 
-Datadog span hierarchy (auto-detected by ddtrace via the LangGraph patch):
+Datadog span hierarchy:
 
-  workflow: swagbot_workflow
-    agent: SwagBot                         ← outer StateGraph
-      agent: Planning                      ← 1 LLM call, outputs routing JSON
-        task: llm
-      agent: Orchestrator                  ← pure dispatch node, no LLM
-        task: orchestrator
-      agent: Customer Service              ← 1 RAG retrieval + 1 LLM call
-        task: rag
-        task: llm
-      agent: Product Specialist            ← 1 RAG retrieval + 1 LLM call (+ tools)
-        task: rag
-        task: llm
-      agent: Promotion Specialist          ← 1 RAG retrieval + 1 LLM call
-        task: rag
-        task: llm
-      agent: Feedback Handler              ← 1 RAG retrieval + 1 LLM call
-        task: rag
-        task: llm
-      agent: Response Synthesizer          ← 1 LLM call, formats HTML response
-        task: llm
+  workflow: swagbot_workflow          ← @dd_workflow + LLMObs.annotate(input, output)
+    agent: SwagBot                    ← auto-detected + AGENT_MANIFEST pre-registered in LangGraphIntegration cache
+      agent: Planning Agent           ← auto-detected (subgraph)
+        task: llm                     ← @dd_task("Intent Analysis") + LLMObs.annotate(input=query, output=routing_json)
+      agent: Orchestrator Agent       ← auto-detected (subgraph)
+        task: orchestrator            ← @dd_task("Agent Dispatch") + LLMObs.annotate(input=request, output=agents_list)
+      agent: Customer Service         ← auto-detected (subgraph)
+        task: rag                     ← @dd_retrieval + LLMObs.annotate(input=query, output=[docs])
+        task: llm                     ← @dd_task("Response Generation") + LLMObs.annotate(input=query, output=response)
+      agent: Product Specialist       ← same pattern
+      agent: Promotion Specialist     ← same pattern
+      agent: Feedback Handler         ← same pattern
+      agent: Response Synthesizer     ← auto-detected (subgraph)
+        task: llm                     ← @dd_task("Response Synthesis") + LLMObs.annotate(input=specialist_texts, output=html)
+
+LLMObs.export_span() is called at workflow level to capture the span context
+for downstream evaluation submission (hallucination detection).
 
 File structure:
   1. State / schema definitions
@@ -68,6 +64,14 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool as lc_tool
 
+# Datadog LLM Observability
+from ddtrace.llmobs.decorators import workflow as dd_workflow, retrieval as dd_retrieval, task as dd_task
+from ddtrace.llmobs import LLMObs
+try:
+    from ddtrace.llmobs.utils import Prompt   # ddtrace < 4.x
+except ImportError:
+    from ddtrace.llmobs import Prompt          # ddtrace >= 4.x
+
 from swagbot_langgraph_config import LangChainConfig
 from swagbot_utils import (
     DocumentUtils, DocumentHandlers, HTMLUtils,
@@ -77,6 +81,21 @@ from swagbot_utils import (
 
 logger = logging.getLogger(__name__)
 config = LangChainConfig()
+
+
+def _llmobs_annotate(**kwargs) -> None:
+    """
+    Safe wrapper around LLMObs.annotate().
+
+    ddtrace raises LLMObsAnnotateSpanError when annotate() is called on a span
+    that has no LLMObs kind set (e.g. inner LangGraph nodes whose task span was
+    not assigned a kind by the patch). Observability code must never crash the
+    application — this wrapper absorbs those errors silently.
+    """
+    try:
+        LLMObs.annotate(**kwargs)
+    except Exception as exc:
+        logger.debug("LLMObs.annotate skipped (non-critical): %s", exc)
 
 
 # ===============================================================================
@@ -107,6 +126,48 @@ class SwagBotOutput(TypedDict):
     workflow_path: Annotated[List[str], operator.add]
 
 
+class PlanningOutput(TypedDict):
+    """Planning output — routing_decision first so Datadog shows the routing JSON."""
+    routing_decision: str
+    messages: Annotated[List[AnyMessage], add_messages]
+    workflow_path: Annotated[List[str], operator.add]
+
+
+class OrchestratorOutput(TypedDict):
+    """Orchestrator output — agents_dispatched first so Datadog shows the routing decision.
+    agents_dispatched is not in SwagBotState so LangGraph drops it on merge."""
+    agents_dispatched: str
+    workflow_path: Annotated[List[str], operator.add]
+
+
+class SpecialistOutput(TypedDict):
+    """Specialist output — response first so Datadog shows the LLM answer.
+    response is not in SwagBotState so LangGraph drops it on merge (no parallel conflict).
+    messages must stay to propagate specialist responses to the synthesizer."""
+    response: str
+    workflow_path: Annotated[List[str], operator.add]
+    messages: Annotated[List[AnyMessage], add_messages]
+
+
+class SynthesizerOutput(TypedDict):
+    """Synthesizer output — output first (final HTML response)."""
+    output: str
+    messages: Annotated[List[AnyMessage], add_messages]
+    workflow_path: Annotated[List[str], operator.add]
+
+
+class PlanningAgentState(MessagesState):
+    """State for the Planning subgraph — adds routing_decision to surface the JSON output in Datadog."""
+    workflow_path: Annotated[List[str], operator.add]
+    routing_decision: str
+
+
+class OrchestratorAgentState(MessagesState):
+    """State for the Orchestrator subgraph — adds agents_dispatched to surface the routing decision in Datadog."""
+    workflow_path: Annotated[List[str], operator.add]
+    agents_dispatched: str
+
+
 class BaseAgentState(MessagesState):
     """
     Base state for all subgraphs. Shares the workflow_path reducer with SwagBotState
@@ -124,8 +185,10 @@ class AgentInput(TypedDict):
 
 
 class SpecialistState(BaseAgentState):
-    """State for specialist subgraphs — passes RAG results from rag_node to llm_node."""
+    """State for specialist subgraphs — passes RAG results from rag_node to llm_node,
+    and captures the final response text for Datadog output display."""
     rag_context: Optional[str]
+    response: str
 
 
 class SynthesizerState(BaseAgentState):
@@ -228,31 +291,100 @@ class SwagBotWorkflow:
 
         compiled = g.compile()
         compiled.name = "SwagBot"
+
+        # Pre-register the agent manifest in ddtrace's LangGraph integration cache.
+        # ddtrace calls _get_agent_manifest(compiled, ...) at span FINISH time and
+        # uses the cached entry if present — overwriting auto-detected fields is not
+        # possible any other way, because ddtrace sets AGENT_MANIFEST at span finish.
+        try:
+            from ddtrace.llmobs._integrations.langgraph import LangGraphIntegration
+            LangGraphIntegration._agent_manifests[compiled] = {
+                "name": "SwagBot",
+                "instructions": (
+                    "SwagBot is a multi-agent e-commerce assistant powered by LangGraph. "
+                    "It routes customer requests to specialized agents and synthesizes their "
+                    "responses into a single, well-formatted HTML answer."
+                ),
+                "handoffs": [
+                    {"agent_name": "Orchestrator Agent", "handoff_description": "Dispatches to the right specialist agents based on the request"},
+                    {"agent_name": "Customer Service Agent", "handoff_description": "Handles order tracking, returns, and support queries"},
+                    {"agent_name": "Product Specialist Agent", "handoff_description": "Provides product information and recommendations"},
+                    {"agent_name": "Promotion Specialist Agent", "handoff_description": "Retrieves deals, discounts, and promotions"},
+                    {"agent_name": "Feedback Handler Agent", "handoff_description": "Processes customer feedback and complaints"},
+                    {"agent_name": "Response Synthesizer Agent", "handoff_description": "Merges all specialist responses into a final answer"},
+                ],
+                "framework": "LangGraph",
+                "model": config.specialist_model,
+            }
+            logger.debug("SwagBot agent manifest pre-registered in ddtrace LangGraph cache")
+        except Exception as exc:
+            logger.warning("Could not pre-register SwagBot agent manifest: %s", exc)
+
         return compiled
 
     # ── Agent builders (in execution order) ───────────────────────────────────
 
     def _build_planning_agent(self, planning_llm: BaseChatModel) -> CompiledStateGraph:
         """
-        Mini StateGraph: single LLM call that outputs routing JSON.
+        Mini StateGraph: single LLM call that outputs routing JSON directly.
         The LLM is prompted to output: {"agents_needed": ["customer_service", ...]}
         _dispatch_specialists parses this JSON from the resulting AIMessage.
         """
-        def planning_llm_node(state: dict) -> dict:
-            prompt_text = self._build_planning_prompt()
-            # Use only the latest HumanMessage for consistent template fingerprint.
-            human_msgs = [m for m in state.get("messages", []) if isinstance(m, HumanMessage)]
-            user_query_msg = human_msgs[-1] if human_msgs else HumanMessage(content="")
-            messages = [SystemMessage(content=prompt_text), user_query_msg]
-            response = planning_llm.invoke(messages)
-            return {"messages": [response], "workflow_path": ["planning"]}
+        # Build-time load for agent manifest registration only.
+        prompt_data = PromptTrackingUtils.load_prompt_with_metadata("planning")
 
-        g = StateGraph(BaseAgentState, input_schema=AgentInput)
+        @dd_task(name="Intent Analysis")
+        def planning_llm_node(state: dict) -> dict:
+            # Reload per request so the Prompt annotation reflects any runtime update.
+            current_prompt_data = PromptTrackingUtils.load_prompt_with_metadata("planning")
+            prompt_text = self._build_planning_prompt()
+            incoming = [m for m in state.get("messages", [])
+                        if not isinstance(m, SystemMessage)]
+            logger.debug("🔍 Planning: %d incoming messages (%s)",
+                         len(incoming),
+                         [type(m).__name__ for m in incoming])
+            # Use only the latest HumanMessage for consistent template fingerprint.
+            human_msgs = [m for m in incoming if isinstance(m, HumanMessage)]
+            user_query_msg = human_msgs[-1] if human_msgs else HumanMessage(content="")
+            user_query = user_query_msg.content if isinstance(user_query_msg.content, str) else ""
+            messages = [SystemMessage(content=prompt_text), user_query_msg]
+            with LLMObs.annotation_context(prompt=Prompt(
+                id=current_prompt_data["id"],
+                version=current_prompt_data["version"],
+                chat_template=[
+                    {"role": "system", "content": prompt_text},
+                    {"role": "user", "content": "{query}"},
+                ],
+                variables={"query": user_query},
+            )):
+                response = planning_llm.invoke(messages)
+            _llmobs_annotate(
+                input_data=user_query,
+                output_data=SwagBotWorkflow._get_str_content(response.content),
+                metadata={"purpose": "routing_decision"},
+            )
+
+            routing_decision = SwagBotWorkflow._get_str_content(response.content)
+            return {"messages": [response], "workflow_path": ["planning"], "routing_decision": routing_decision}
+
+        g = StateGraph(PlanningAgentState, input_schema=AgentInput, output_schema=PlanningOutput)
         g.add_node("llm", planning_llm_node)
         g.add_edge(START, "llm")
         g.add_edge("llm", END)
         compiled = g.compile()
         compiled.name = "Planning Agent"
+
+        try:
+            from ddtrace.llmobs._integrations.langgraph import LangGraphIntegration
+            LangGraphIntegration._agent_manifests[compiled] = {
+                "name": "Planning Agent",
+                "instructions": prompt_data["template"],
+                "framework": "LangGraph",
+                "model": config.planning_model,
+            }
+        except Exception as exc:
+            logger.warning("Could not pre-register Planning Agent manifest: %s", exc)
+
         return compiled
 
     def _build_orchestrator_node(self) -> CompiledStateGraph:
@@ -260,6 +392,7 @@ class SwagBotWorkflow:
         Pure coordination node — zero LLM calls.
         Reads Planning's routing decision from messages and logs the dispatch context.
         """
+        @dd_task(name="Agent Dispatch")
         def orchestrator_node(state: dict) -> dict:
             agents_needed: List[str] = []
             user_request = ""
@@ -274,14 +407,35 @@ class SwagBotWorkflow:
                     except (json.JSONDecodeError, TypeError, AttributeError) as exc:
                         logger.debug("Could not parse Planning JSON in orchestrator: %s", exc)
             logger.info("🎯 Orchestrator: %.60r → %s", user_request, agents_needed)
-            return {"workflow_path": ["orchestrator"]}
 
-        g = StateGraph(BaseAgentState, input_schema=AgentInput)
+            _llmobs_annotate(
+                input_data=user_request,
+                output_data=str(agents_needed),
+                metadata={"routing_decision": agents_needed},
+            )
+
+            return {"workflow_path": ["orchestrator"], "agents_dispatched": str(agents_needed)}
+
+        g = StateGraph(OrchestratorAgentState, input_schema=AgentInput, output_schema=OrchestratorOutput)
         g.add_node("orchestrator", orchestrator_node)
         g.add_edge(START, "orchestrator")
         g.add_edge("orchestrator", END)
         compiled = g.compile()
         compiled.name = "Orchestrator Agent"
+
+        try:
+            from ddtrace.llmobs._integrations.langgraph import LangGraphIntegration
+            LangGraphIntegration._agent_manifests[compiled] = {
+                "name": "Orchestrator Agent",
+                "instructions": (
+                    "Reads the Planning Agent's routing decision and prepares the dispatch context "
+                    "for specialist agents. No LLM call — pure coordination logic."
+                ),
+                "framework": "LangGraph",
+            }
+        except Exception as exc:
+            logger.warning("Could not pre-register Orchestrator Agent manifest: %s", exc)
+
         return compiled
 
     def _build_specialist_agent(
@@ -297,20 +451,25 @@ class SwagBotWorkflow:
         Optionally augmented with tools — if provided, the LLM can call them
         and a second LLM call produces the final answer with tool results.
 
-        Without tools:
+        Without tools — Datadog span hierarchy:
           agent: <name>
-            task: rag   ← deterministic KB search
-            task: llm   ← single LLM call with retrieved context
+            task: rag   ← @dd_retrieval + LLMObs.annotate(query, [docs])
+            task: llm   ← @dd_task("Response Generation") + LLMObs.annotate(query, response)
 
-        With tools:
+        With tools — Datadog span hierarchy:
           agent: <name>
-            task: rag   ← deterministic KB search
+            task: rag   ← @dd_retrieval + LLMObs.annotate(query, [docs])
             task: llm   ← LLM decides whether to call a tool
             task: tools ← tool execution (if called)
-            task: llm   ← final LLM call with tool results
+            task: llm   ← @dd_task("Response Generation") + LLMObs.annotate(query, final response with tool results)
         """
+        # Build-time load for agent manifest registration only.
+        _type_key = name.replace(" Agent", "").lower().replace(" ", "-")
+        prompt_data = PromptTrackingUtils.load_prompt_with_metadata(_type_key)
+
         llm_bound = llm.bind_tools(tools) if tools else llm
 
+        @dd_retrieval(name=f"{name} Retrieval")
         def rag_node(state: dict) -> dict:
             user_query = next(
                 (m.content for m in state.get("messages", [])
@@ -318,21 +477,40 @@ class SwagBotWorkflow:
                 "",
             )
             if not user_query:
+                _llmobs_annotate(input_data="", output_data=[])
                 return {"rag_context": ""}
             docs = _rag_search_raw(agent_types, user_query)
+            _llmobs_annotate(
+                input_data=user_query,
+                output_data=[
+                    {
+                        "id": str(i),
+                        "text": d.get("content", ""),
+                        "score": d.get("score", 0),
+                        "name": d.get("name", "Document"),
+                    }
+                    for i, d in enumerate(docs)
+                ],
+            )
             return {"rag_context": _format_docs_for_llm(docs)}
 
+        @dd_task(name="Response Generation")
         def llm_node(state: dict) -> dict:
+            # Reload per request so the Prompt annotation reflects any runtime update.
+            current_prompt_data = PromptTrackingUtils.load_prompt_with_metadata(_type_key)
             prompt_text = prompt_fn()
             messages_in = state.get("messages", [])
 
-            last_msg = messages_in[-1] if messages_in else None
-            rag_context = (state.get("rag_context") or "").strip()
+            # Resolve user_query once — used in both message building and Prompt variables
+            # so Playground can pre-populate the 'query' variable from any saved trace.
             user_query = next(
                 (m.content for m in messages_in
                  if isinstance(m, HumanMessage) and (m.content or "").strip()),
                 "",
             )
+
+            last_msg = messages_in[-1] if messages_in else None
+            rag_context = (state.get("rag_context") or "").strip()
             # Always use the same template structure so prompt tracking sees a single fingerprint
             effective_context = rag_context if rag_context else "No relevant products found in knowledge base."
             human_content = (
@@ -340,6 +518,10 @@ class SwagBotWorkflow:
                 f"\n\nCustomer question: {user_query}"
             )
             messages = [SystemMessage(content=prompt_text), HumanMessage(content=human_content)]
+            prompt_variables: dict = (
+                {"query": user_query, "context": rag_context}
+                if rag_context else {"query": user_query}
+            )
             if isinstance(last_msg, ToolMessage):
                 # After a tool call, keep the knowledge-base context and append the tool call
                 # + its results. Without the context the LLM invents details (e.g. a price).
@@ -349,12 +531,35 @@ class SwagBotWorkflow:
                 )
                 messages += messages_in[tool_call_idx:]
 
-            response = llm_bound.invoke(messages)
+            # Match the exact format used in the actual HumanMessage so Playground
+            # reconstructs the message correctly when testing prompt variants.
+            chat_user_content = (
+                "Context from knowledge base:\n\n{context}\n\nCustomer question: {query}"
+                if "context" in prompt_variables
+                else "{query}"
+            )
+            with LLMObs.annotation_context(prompt=Prompt(
+                id=current_prompt_data["id"],
+                version=current_prompt_data["version"],
+                chat_template=[
+                    {"role": "system", "content": prompt_text},
+                    {"role": "user", "content": chat_user_content},
+                ],
+                variables=prompt_variables,
+            )):
+                response = llm_bound.invoke(messages)
             # Only update workflow_path on the final response (not when a tool call is pending)
             has_tool_calls = bool(getattr(response, "tool_calls", None))
             result: dict = {"messages": [response]}
             if not has_tool_calls:
                 result["workflow_path"] = [name]
+                result["response"] = SwagBotWorkflow._get_str_content(response.content)
+                rag_ctx = (state.get("rag_context") or "").strip()
+                _llmobs_annotate(
+                    input_data=user_query,
+                    output_data=SwagBotWorkflow._get_str_content(response.content),
+                    **({"expected_output": rag_ctx} if rag_ctx else {}),
+                )
             return result
 
         def should_call_tools(state: dict) -> str:
@@ -363,7 +568,7 @@ class SwagBotWorkflow:
                 return "tools"
             return END
 
-        g = StateGraph(SpecialistState, input_schema=AgentInput)
+        g = StateGraph(SpecialistState, input_schema=AgentInput, output_schema=SpecialistOutput)
         g.add_node("rag", rag_node)
         g.add_node("llm", llm_node)
         g.add_edge(START, "rag")
@@ -378,19 +583,46 @@ class SwagBotWorkflow:
 
         compiled = g.compile()
         compiled.name = name
+
+        try:
+            from ddtrace.llmobs._integrations.langgraph import LangGraphIntegration
+            tool_manifest = [
+                {"name": t.name, "description": t.description} for t in (tools or [])
+            ]
+            LangGraphIntegration._agent_manifests[compiled] = {
+                "name": name,
+                "instructions": prompt_data["template"],
+                "tools": tool_manifest,
+                "framework": "LangGraph",
+                "model": config.specialist_model,
+            }
+        except Exception as exc:
+            logger.warning("Could not pre-register %s manifest: %s", name, exc)
+
         return compiled
 
     def _build_synthesizer_agent(self, llm: BaseChatModel) -> CompiledStateGraph:
         """
         Synthesizer: formats all specialist text responses as a single HTML answer.
         Writes directly to SynthesizerState.output, which propagates to SwagBotState.output.
-        """
-        _PROMPT_SIZE_LIMIT = 4000  # chars; v2.0 prompt (~5100) exceeds this, v2.1 (~3300) does not
 
+        Context passed to the LLM: a single HumanMessage holding the specialist answers
+        (Planning's routing JSON is stripped by _extract_text_messages) and the user question.
+        """
+        # prompt_data for agent manifest is loaded at build time (used once below).
+        # Inside llm_node, metadata is reloaded per request so the version and template
+        # always reflect the file on disk — critical when the student deploys a new prompt
+        # (e.g. v2.1.0) without restarting the container.
+        prompt_data = PromptTrackingUtils.load_prompt_with_metadata("synthesizer")
+
+        _PROMPT_SIZE_LIMIT = 4000  # chars; v2.0 prompt (4990) exceeds this, v2.1 (3340) does not
+
+        @dd_task(name="Response Synthesis")
         def llm_node(state: dict) -> dict:
             from google.api_core.exceptions import ResourceExhausted
             text_msgs = SwagBotWorkflow._extract_text_messages(state.get("messages", []))
             specialist_responses = [m for m in text_msgs if isinstance(m, AIMessage)]
+            original_query = next((m for m in text_msgs if isinstance(m, HumanMessage)), None)
             logger.info("🔀 Synthesizer: formatting %d specialist response(s) as HTML",
                         len(specialist_responses))
             prompt_text = self._build_synthesizer_prompt()
@@ -400,20 +632,47 @@ class SwagBotWorkflow:
                     f"Prompt size ({len(prompt_text)} chars) exceeds the allowed limit. "
                     "Please reduce the size of the synthesizer prompt."
                 )
-            original_query = next((m for m in text_msgs if isinstance(m, HumanMessage)), None)
-            reference = "\n\n---\n\n".join(
-                t for t in (SwagBotWorkflow._get_str_content(m.content) for m in specialist_responses)
-                if t.strip()
-            )
-            user_question = SwagBotWorkflow._get_str_content(original_query.content) if original_query else ""
-            # Specialist answers go in the USER turn as explicit context. Passing them as prior
-            # ASSISTANT turns made Gemini 3.x re-answer the repeated question and invent
-            # missing facts (e.g. a price).
+
+            # Reload metadata per request — picks up the updated version and template
+            # immediately when the student deploys a new prompt without restarting.
+            current_prompt_data = PromptTrackingUtils.load_prompt_with_metadata("synthesizer")
+
+            # Build reference before llm.invoke — needed for Prompt rag_context_variables.
+            specialist_texts = [
+                SwagBotWorkflow._get_str_content(m.content)
+                for m in specialist_responses
+                if SwagBotWorkflow._get_str_content(m.content).strip()
+            ]
+            reference = "\n\n---\n\n".join(specialist_texts)
+            user_question = SwagBotWorkflow._get_str_content(
+                original_query.content) if original_query else ""
+
+            # Specialist answers go in the USER turn as explicit context, matching the
+            # chat_template below. Passing them as prior ASSISTANT turns made Gemini 3.x
+            # re-answer the repeated question and invent missing facts (e.g. a price).
             messages = [
                 SystemMessage(content=prompt_text),
                 HumanMessage(content=f"Context:\n{reference}\n\nQuestion: {user_question}"),
             ]
-            response = llm.invoke(messages)
+            # Annotate the auto-instrumented LangChain LLM span with RAG context variables
+            # so Datadog hallucination evaluation can compare output against specialist context.
+            with LLMObs.annotation_context(
+                prompt=Prompt(
+                    id=current_prompt_data["id"],
+                    version=current_prompt_data["version"],
+                    chat_template=[
+                        {"role": "system", "content": prompt_text},
+                        {"role": "user", "content": "Context:\n{context}\n\nQuestion: {query}"},
+                    ],
+                    variables={
+                        "query": user_question,
+                        "context": reference,
+                    },
+                    rag_query_variables=["query"],
+                    rag_context_variables=["context"],
+                ),
+            ):
+                response = llm.invoke(messages)
             output_text = SwagBotWorkflow._get_str_content(response.content)
             # Strip markdown code fences the LLM occasionally wraps around HTML output.
             output_text = re.sub(r'^```(?:html)?\s*\n?', '', output_text.strip())
@@ -424,44 +683,71 @@ class SwagBotWorkflow:
             output_text = re.sub(
                 r'\[PRODUCT_IMAGE:([^\]]+)\]',
                 lambda m: (
-                    f'<img src="/static/images/{html.escape(os.path.basename(m.group(1)), quote=True)}"'
+                    f'<img src="/static/images/{html.escape(os.path.basename(m.group(1)))}"'
                     f' alt="Product image" style="max-width:180px;display:block;margin:6px 0">'
                 ),
                 output_text,
             )
-            # Remove <img> tags with external (http/https) src — hallucinated by the model.
+            # Remove <img> tags with external (http/https) src — the model hallucinated them.
             output_text = re.sub(
                 r'<img\b[^>]*\bsrc=["\']https?://[^"\']*["\'][^>]*/?>',
-                '', output_text, flags=re.IGNORECASE,
+                '',
+                output_text,
+                flags=re.IGNORECASE,
             )
             # Strip <a href="http(s)://..."> wrappers, keeping their visible text.
             output_text = re.sub(
                 r'<a\b[^>]*\bhref=["\']https?://[^"\']*["\'][^>]*>(.*?)</a>',
-                r'\1', output_text, flags=re.IGNORECASE | re.DOTALL,
+                r'\1',
+                output_text,
+                flags=re.IGNORECASE | re.DOTALL,
             )
             # Strip <a> wrappers around <img> tags (regardless of href type).
             output_text = re.sub(
                 r'<a\b[^>]*>\s*(<img\b[^>]*/?>)\s*</a>',
-                r'\1', output_text, flags=re.IGNORECASE | re.DOTALL,
+                r'\1',
+                output_text,
+                flags=re.IGNORECASE | re.DOTALL,
             )
+
             # Final allowlist sanitization pass — defense in depth against
             # any HTML the regex cleanups above don't anticipate.
             output_text = HTMLUtils.sanitize_llm_html(output_text)
+
+            # Annotate the Response Synthesis task span with input/output for Datadog UI.
+            _llmobs_annotate(
+                input_data=reference,
+                output_data=output_text,
+                **({"expected_output": reference} if reference else {}),
+            )
+
             return {
                 "messages": [response],
                 "workflow_path": ["synthesizer"],
                 "output": output_text,
             }
 
-        g = StateGraph(SynthesizerState, input_schema=AgentInput)
+        g = StateGraph(SynthesizerState, input_schema=AgentInput, output_schema=SynthesizerOutput)
         g.add_node("llm", llm_node)
         g.add_edge(START, "llm")
         g.add_edge("llm", END)
         compiled = g.compile()
         compiled.name = "Response Synthesizer Agent"
+
+        try:
+            from ddtrace.llmobs._integrations.langgraph import LangGraphIntegration
+            LangGraphIntegration._agent_manifests[compiled] = {
+                "name": "Response Synthesizer Agent",
+                "instructions": prompt_data["template"],
+                "framework": "LangGraph",
+                "model": config.synthesizer_model,
+            }
+        except Exception as exc:
+            logger.warning("Could not pre-register Response Synthesizer Agent manifest: %s", exc)
+
         return compiled
 
-    # ── Routing ───────────────────────────────────────────────────────────────
+    # ── Routing (edge functions) ───────────────────────────────────────────────
 
     @staticmethod
     def _dispatch_specialists(state: SwagBotState) -> Sequence[Send]:
@@ -469,6 +755,7 @@ class SwagBotWorkflow:
         Parse Planning's routing JSON from its AIMessage and fan-out to specialists.
         Falls back to customer_service if the JSON cannot be parsed.
         """
+
         valid = {"customer_service", "product_specialist", "promotion_specialist", "feedback_handler"}
         agents_needed: List[str] = []
 
@@ -499,60 +786,7 @@ class SwagBotWorkflow:
         logger.info("📤 Dispatching to: %s", [s.node for s in sends])
         return sends
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    @staticmethod
-    def _get_str_content(content) -> str:
-        """
-        Normalise LangChain message content to a plain string.
-        Gemini may return content as a list of part-dicts, e.g.
-        [{"type": "text", "text": "..."}]. Extract and join text parts.
-        """
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "".join(
-                p.get("text", "") if isinstance(p, dict) else str(p)
-                for p in content
-            )
-        return ""
-
-    def _extract_text_messages(messages: list) -> list:
-        """
-        Return only text-bearing messages safe to pass to any LLM call.
-        Keeps HumanMessages and AIMessages with text content (no tool_calls).
-        Strips Planning's routing JSON so it does not pollute the Synthesizer's context.
-        Handles content that is either a str or a list of part-dicts (Gemini format).
-        """
-        result = []
-        for m in messages:
-            text = SwagBotWorkflow._get_str_content(m.content)
-            if isinstance(m, HumanMessage) and text.strip():
-                result.append(m)
-            elif (isinstance(m, AIMessage)
-                  and not (m.tool_calls or [])
-                  and text.strip()):
-                try:
-                    cleaned = SwagBotWorkflow._extract_json_content(text)
-                    data = json.loads(cleaned)
-                    if isinstance(data, dict) and "agents_needed" in data:
-                        continue
-                except (json.JSONDecodeError, TypeError, AttributeError) as exc:
-                    logger.debug("Message is not Planning JSON (expected): %s", exc)
-                result.append(m)
-        return result
-
-    @staticmethod
-    def _extract_json_content(text: str) -> str:
-        """Strip markdown code fences (```json ... ``` or ``` ... ```) if present."""
-        result = text.strip()
-        if result.startswith("```"):
-            result = re.sub(r'^```(?:json)?\s*\n?', '', result)
-            result = re.sub(r'\n?```\s*$', '', result)
-        return result.strip()
-
-    # ── Prompt builders ───────────────────────────────────────────────────────
+    # ── Prompt helpers (loaded from disk on every call) ────────────────────────
 
     @staticmethod
     def _load_prompt(agent_type: str) -> str:
@@ -583,7 +817,63 @@ class SwagBotWorkflow:
                 "Deliver specialist responses to the customer as one clear, complete, and well-formatted answer."
             )
 
-    # ── Public interface ──────────────────────────────────────────────────────
+    # ── Message helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_str_content(content) -> str:
+        """
+        Normalise LangChain message content to a plain string.
+        Gemini (and other providers) may return content as a list of part-dicts
+        e.g. [{"type": "text", "text": "..."}].  We extract the text parts and
+        join them so the rest of the code always works with a string.
+        """
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                p.get("text", "") if isinstance(p, dict) else str(p)
+                for p in content
+            )
+        return ""
+
+    @staticmethod
+    def _extract_json_content(text: str) -> str:
+        """Strip markdown code fences (```json ... ``` or ``` ... ```) if present."""
+        result = text.strip()
+        if result.startswith("```"):
+            result = re.sub(r'^```(?:json)?\s*\n?', '', result)
+            result = re.sub(r'\n?```\s*$', '', result)
+        return result.strip()
+
+    @staticmethod
+    def _extract_text_messages(messages: list) -> list:
+        """
+        Return only text-bearing messages safe to pass to any Gemini LLM call.
+
+        Keeps HumanMessages and AIMessages with text content (no tool_calls).
+        Strips Planning's routing JSON (AIMessage with "agents_needed" key) so it
+        does not pollute the Synthesizer's context.
+        Handles content that is either a str or a list of part-dicts (Gemini format).
+        """
+        result = []
+        for m in messages:
+            text = SwagBotWorkflow._get_str_content(m.content)
+            if isinstance(m, HumanMessage) and text.strip():
+                result.append(m)
+            elif (isinstance(m, AIMessage)
+                  and not (m.tool_calls or [])
+                  and text.strip()):
+                try:
+                    cleaned = SwagBotWorkflow._extract_json_content(text)
+                    data = json.loads(cleaned)
+                    if isinstance(data, dict) and "agents_needed" in data:
+                        continue
+                except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+                    logger.debug("Message is not Planning JSON (expected): %s", exc)
+                result.append(m)
+        return result
+
+    # ── Public interface ───────────────────────────────────────────────────────
 
     def process_request(self, input: str) -> Dict[str, Any]:
         return process_swagbot_request(input)
@@ -619,32 +909,35 @@ def get_order_status(order_id: str) -> str:
 def check_product_availability(product_name: str) -> str:
     """Check the current stock availability for a SwagBot product by name."""
     catalog = {
-        "dog headphones":          {"status": "Low Stock",    "quantity": 3,   "note": "Only 3 units left — order soon."},
-        "dog steel bottle":        {"status": "In Stock",     "quantity": 42,  "note": None},
-        "dog t-shirt":             {"status": "In Stock",     "quantity": 85,  "note": "Available in all sizes."},
-        "dog t-shirt i love you":  {"status": "Out of Stock", "quantity": 0,   "note": "Restock expected in 2-3 weeks."},
-        "dog sweatshirt gray":     {"status": "In Stock",     "quantity": 31,  "note": "Available in S, M, L, XL."},
-        "dog sweatshirt black":    {"status": "Low Stock",    "quantity": 2,   "note": "Only 2 units left."},
-        "dog notebook":            {"status": "In Stock",     "quantity": 60,  "note": None},
-        "dog sko notebook":        {"status": "Out of Stock", "quantity": 0,   "note": "Limited edition — no restock planned."},
-        "dog mug":                 {"status": "In Stock",     "quantity": 120, "note": None},
-        "dog hoodie":              {"status": "In Stock",     "quantity": 18,  "note": "Available in M, L, XL."},
-        "dog plastic bottle":      {"status": "In Stock",     "quantity": 55,  "note": None},
-        "dog sticker pack":        {"status": "In Stock",     "quantity": 200, "note": None},
-        "dog beanie":              {"status": "Pre-order",    "quantity": 0,   "note": "Ships from April 15, 2026."},
+        "dog headphones":          {"status": "Low Stock",   "quantity": 3,  "note": "Only 3 units left — order soon.", "image": "/static/images/headphones.jpg"},
+        "dog steel bottle":        {"status": "In Stock",    "quantity": 42, "note": None,                              "image": "/static/images/steel-bottle.jpg"},
+        "dog t-shirt":             {"status": "In Stock",    "quantity": 85, "note": "Available in all sizes.",         "image": "/static/images/t-shirt.jpg"},
+        "dog t-shirt i love you":  {"status": "Out of Stock","quantity": 0,  "note": "Restock expected in 2-3 weeks.",  "image": "/static/images/t-shirt-i-love-u.jpg"},
+        "dog sweatshirt gray":     {"status": "In Stock",    "quantity": 31, "note": "Available in S, M, L, XL.",       "image": "/static/images/sweatshirt-gray.jpg"},
+        "dog sweatshirt black":    {"status": "Low Stock",   "quantity": 2,  "note": "Only 2 units left.",              "image": "/static/images/sweatshirt-black.jpg"},
+        "dog notebook":            {"status": "In Stock",    "quantity": 60, "note": None,                              "image": "/static/images/notebook.jpg"},
+        "dog sko notebook":        {"status": "Out of Stock","quantity": 0,  "note": "Limited edition — no restock planned.", "image": "/static/images/sko-notebook.jpg"},
+        "dog mug":                 {"status": "In Stock",    "quantity": 120,"note": None,                              "image": "/static/images/mug.jpg"},
+        "dog hoodie":              {"status": "In Stock",    "quantity": 18, "note": "Available in M, L, XL.",          "image": "/static/images/hoodie.png"},
+        "dog plastic bottle":      {"status": "In Stock",    "quantity": 55, "note": None,                              "image": "/static/images/plastic-bottle.png"},
+        "dog sticker pack":        {"status": "In Stock",    "quantity": 200,"note": None,                              "image": "/static/images/sticker-pack.png"},
+        "dog beanie":              {"status": "Pre-order",   "quantity": 0,  "note": "Ships from April 15, 2026.",      "image": "/static/images/beanie.png"},
     }
     query = product_name.lower().strip()
+    # Exact match first, then partial match
     match = catalog.get(query) or next(
         (v for k, v in catalog.items() if query in k or k in query), None
     )
     if not match:
         return f"Product '{product_name}' not found in the catalog. Please check the product name."
-    status, qty, note = match["status"], match["quantity"], match["note"]
+    status, qty, note, image = match["status"], match["quantity"], match["note"], match.get("image")
     result = f"{product_name} — {status}."
     if qty > 0:
         result += f" {qty} units available."
     if note:
         result += f" {note}"
+    if image:
+        result += f" [PRODUCT_IMAGE:{image}]"
     return result
 
 
@@ -685,7 +978,7 @@ def _format_docs_for_llm(docs: List[Dict[str, Any]]) -> str:
     """
     Format retrieved documents as an LLM-readable context string.
     Uses [PRODUCT_IMAGE:/path] placeholders instead of <img> tags so the LLM
-    cannot hallucinate or modify the image path.  Post-processing in the synthesizer
+    cannot hallucinate or modify the image path.  The synthesizer post-processing
     converts these placeholders back to <img> tags before returning the response.
     """
     if not docs:
@@ -701,7 +994,7 @@ def _format_docs_for_llm(docs: List[Dict[str, Any]]) -> str:
 
 
 # ===============================================================================
-# LLM INFRASTRUCTURE
+# LLM CALLER
 # ===============================================================================
 
 class LLMCaller:
@@ -723,6 +1016,14 @@ class LLMCaller:
         return self._cache[llm_type]
 
 
+# ===============================================================================
+# LLM FACTORY
+# ===============================================================================
+
+# This image (langgraph.vertexai.v0.1) targets Vertex AI (GCP).
+# To add OpenAI or Azure support:
+#   1. Add langchain-openai==1.1.12 to requirements.txt
+#   2. Restore the _openai() and _azure() methods below and their branches in create()
 class LLMFactory:
     @staticmethod
     def create(platform: str, model_cfg: Dict[str, Any]) -> BaseChatModel:
@@ -730,10 +1031,6 @@ class LLMFactory:
             return LLMFactory._vertex(model_cfg)
         elif platform == "bedrock":
             return LLMFactory._bedrock(model_cfg)
-        elif platform == "openai":
-            return LLMFactory._openai(model_cfg)
-        elif platform == "azure":
-            return LLMFactory._azure(model_cfg)
         raise ValueError(f"Unsupported platform: {platform}")
 
     @staticmethod
@@ -758,31 +1055,9 @@ class LLMFactory:
             model_kwargs={"temperature": c.get("temperature", 0.3), "max_tokens": c.get("max_tokens", 1000)},
         )
 
-    @staticmethod
-    def _openai(c: Dict[str, Any]) -> BaseChatModel:
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=c["model_id"],
-            api_key=c.get("api_key"),
-            temperature=c.get("temperature", 0.3),
-            max_tokens=c.get("max_tokens", 1000),
-        )
-
-    @staticmethod
-    def _azure(c: Dict[str, Any]) -> BaseChatModel:
-        from langchain_openai import AzureChatOpenAI
-        return AzureChatOpenAI(
-            deployment_name=c["model_id"],
-            azure_endpoint=c.get("azure_endpoint"),
-            api_key=c.get("api_key"),
-            api_version=c.get("api_version", "2024-02-15-preview"),
-            temperature=c.get("temperature", 0.3),
-            max_tokens=c.get("max_tokens", 1000),
-        )
-
 
 # ===============================================================================
-# ENTRY POINT
+# GLOBAL INSTANCE
 # ===============================================================================
 
 try:
@@ -797,19 +1072,30 @@ except Exception as _init_exc:
     raise
 
 
+# ===============================================================================
+# ENTRY POINT
+# ===============================================================================
+
+@dd_workflow(name="swagbot_workflow")
 def process_swagbot_request(input: str) -> Dict[str, Any]:
     """
     Main entry point — called by swagbot_app.py.
-    No Datadog decorators — ddtrace discovers everything automatically
-    via the LangGraph patch (ddtrace-run in docker-compose entrypoint).
+
+    @dd_workflow creates the outer `workflow: swagbot_workflow` span.
+    The LangGraph invoke creates `agent: SwagBot` inside it (auto-detected).
+    Agent manifest metadata is annotated directly on this workflow span using flat keys
+    (instructions, tools, handoffs, framework) — the Datadog UI reads these as the manifest.
+    LLMObs.export_span() captures the workflow span context for evaluation submission.
     """
     try:
-        result = swagbot_workflow.app.invoke({
-            "input": input,
-            "output": "",
-            "messages": [HumanMessage(content=input)],
-            "workflow_path": [],
-        })
+        result = swagbot_workflow.app.invoke(
+            {
+                "input": input,
+                "output": "",
+                "messages": [HumanMessage(content=input)],
+                "workflow_path": [],
+            },
+        )
 
         # Synthesizer writes output directly to state via SynthesizerState.output
         final = result.get("output") or next(
@@ -817,8 +1103,30 @@ def process_swagbot_request(input: str) -> Dict[str, Any]:
              if isinstance(m, AIMessage) and SwagBotWorkflow._get_str_content(m.content).strip()),
             "No response generated.",
         )
-        # Do NOT strip HTML — the UI renders the response as HTML (images, formatting)
-        return {"output": final, "input": input, "error": ""}
+
+        # Strip HTML tags for clean text in Datadog UI (the app still receives the original HTML)
+        clean_output = re.sub(r"<[^>]+>", " ", final).strip()
+        clean_output = re.sub(r"\s{2,}", " ", clean_output)
+
+        agents_used = result.get("workflow_path", [])
+
+        # Annotate the workflow span with the final input/output and runtime metadata.
+        # The Agent Manifest for the SwagBot AGENT span is set separately in
+        # _dispatch_specialists() via span._set_ctx_item(AGENT_MANIFEST, {...}).
+        _llmobs_annotate(
+            input_data=input,
+            output_data=clean_output,
+            metadata={
+                "workflow_type": "swagbot_langgraph",
+                "workflow_path": agents_used,
+            },
+        )
+
+        # Export the LLMObs workflow span context for evaluation submission (hallucination detection)
+        span_context = LLMObs.export_span(span=None)
+
+        # Return the original HTML output — the SwagBot UI renders it as formatted HTML
+        return {"output": final, "input": input, "error": "", "span_context": span_context}
 
     except Exception as exc:
         logger.error("Workflow error: %s", exc, exc_info=True)
